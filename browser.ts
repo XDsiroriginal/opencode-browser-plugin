@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { execFileSync, spawn } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import net from "node:net"
 import os from "node:os"
@@ -44,13 +45,399 @@ type BrowserOptions = {
   width?: number
   height?: number
   timeoutMs?: number
+  overlay?: boolean
 }
 
 const SYSTEM_HINT = `# Browser control (text only)
 
 You cannot see images. Use browser_snapshot to "see" a web page: it returns the URL, title, visible text, headings and interactive elements with refs like e12.
 Refs are valid until the next snapshot; action tools already return a fresh compact snapshot, otherwise call browser_snapshot again after the page changes.
-Use browser_click / browser_type with a ref (or a CSS selector when you know it). Prefer text snapshots over screenshots.`
+Use browser_click / browser_type with a ref (or a CSS selector when you know it). Prefer text snapshots over screenshots.
+A small overlay panel in the bottom-right corner of the browser shows live activity and lets the user chat with the model in real time. You can control it with browser_overlay.`
+
+const OVERLAY_BINDING = "__opencodeBrowserBridge"
+const OVERLAY_GLOBAL = "__OPENCODE_BROWSER_OVERLAY__"
+
+type OverlayMessage = { role: "user" | "assistant" | "system"; text: string; pending?: boolean }
+type OverlayActivity = { text: string; level: "info" | "browser" | "tool" | "error"; at: number }
+type OverlayPayload =
+  | { kind: "activity"; text: string; level: OverlayActivity["level"]; at: number }
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string; done: boolean }
+  | { kind: "system"; text: string }
+  | { kind: "status"; text: string; busy: boolean }
+  | { kind: "url"; url: string }
+  | { kind: "restore"; messages: OverlayMessage[]; activity: OverlayActivity[]; busy: boolean; status: string; visible: boolean; url: string }
+  | { kind: "show" }
+  | { kind: "hide" }
+  | { kind: "clear" }
+
+function overlayBootstrap(token) {
+  try {
+    if (window.top && window.top !== window) return
+  } catch (error) {
+    return
+  }
+  var GLOBAL = "__OPENCODE_BROWSER_OVERLAY__"
+  var BINDING = "__opencodeBrowserBridge"
+  var HOST_ID = "__opencode-browser-overlay-host"
+  var TOKEN = String(token || "")
+  var bridge = typeof window[BINDING] === "function" ? window[BINDING] : null
+  var stringify = JSON.stringify
+  var existing = window[GLOBAL]
+  if (existing && typeof existing.apply === "function") return
+  if (document.getElementById(HOST_ID)) return
+
+  var state = { messages: [], activity: [], busy: false, status: "готово", visible: true, url: location.href }
+  var host
+  var root
+  var els
+  var currentAssistant = null
+  var minimized = false
+
+  function pad(value) {
+    return (value < 10 ? "0" : "") + value
+  }
+
+  function clock(at) {
+    var date = at ? new Date(at) : new Date()
+    return pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds())
+  }
+
+  function send(payload) {
+    try {
+      var fn = bridge
+      if (typeof fn !== "function" && typeof window[BINDING] === "function") fn = window[BINDING]
+      if (typeof fn !== "function") return false
+      var message = payload && typeof payload === "object" ? payload : {}
+      message.token = TOKEN
+      fn(stringify(message))
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  function scrollToEnd(element) {
+    if (element) element.scrollTop = element.scrollHeight
+  }
+
+  function renderMessage(message) {
+    var element = document.createElement("div")
+    element.className = "msg " + message.role + (message.pending ? " pending" : "")
+    element.textContent = message.text || (message.pending ? "…" : "")
+    els.chat.appendChild(element)
+    return element
+  }
+
+  function trimMessages() {
+    while (state.messages.length > 40) state.messages.shift()
+  }
+
+  function addMessage(role, text, pending) {
+    var message = { role: role, text: text || "", pending: !!pending }
+    state.messages.push(message)
+    trimMessages()
+    var element = renderMessage(message)
+    if (role === "assistant") currentAssistant = element
+    else currentAssistant = null
+    scrollToEnd(els.chat)
+    return element
+  }
+
+  function setAssistant(text, done) {
+    if (!currentAssistant) currentAssistant = addMessage("assistant", "", true)
+    currentAssistant.textContent = text || (done ? "(нет ответа)" : "…")
+    currentAssistant.classList.toggle("pending", !done && !text)
+    var last = state.messages[state.messages.length - 1]
+    if (last && last.role === "assistant") {
+      last.text = text || ""
+      last.pending = !done
+    } else {
+      state.messages.push({ role: "assistant", text: text || "", pending: !done })
+      trimMessages()
+    }
+    scrollToEnd(els.chat)
+  }
+
+  function renderActivity(entry) {
+    var line = document.createElement("div")
+    line.className = "line " + (entry.level || "browser")
+    line.textContent = clock(entry.at) + "  " + (entry.text || "")
+    els.activity.appendChild(line)
+    while (els.activity.childNodes.length > 80) els.activity.removeChild(els.activity.firstChild)
+  }
+
+  function addActivity(text, level, at) {
+    var entry = { text: String(text || ""), level: level || "browser", at: at || Date.now() }
+    state.activity.push(entry)
+    while (state.activity.length > 80) state.activity.shift()
+    renderActivity(entry)
+    scrollToEnd(els.activity)
+  }
+
+  function setStatus(text, busy) {
+    state.status = text || (busy ? "модель отвечает…" : "готово")
+    state.busy = !!busy
+    els.status.textContent = state.status
+    els.dot.classList.toggle("on", !state.busy)
+    els.input.disabled = state.busy
+    els.send.disabled = state.busy
+    els.input.placeholder = state.busy ? "модель отвечает…" : "Написать нейросети…"
+  }
+
+  function setUrl(url) {
+    state.url = url || location.href
+    els.url.textContent = state.url
+    els.url.title = state.url
+  }
+
+  function clearAll() {
+    state.messages = []
+    state.activity = []
+    currentAssistant = null
+    els.chat.innerHTML = ""
+    els.activity.innerHTML = ""
+  }
+
+  function restore(payload) {
+    state.messages = Array.isArray(payload.messages) ? payload.messages.slice(-40) : []
+    state.activity = Array.isArray(payload.activity) ? payload.activity.slice(-80) : []
+    state.busy = !!payload.busy
+    state.status = payload.status || (state.busy ? "модель отвечает…" : "готово")
+    state.visible = payload.visible !== false
+    state.url = payload.url || location.href
+    els.chat.innerHTML = ""
+    els.activity.innerHTML = ""
+    currentAssistant = null
+    for (var i = 0; i < state.messages.length; i += 1) {
+      var message = state.messages[i]
+      var element = renderMessage(message)
+      if (message.role === "assistant") currentAssistant = element
+      else currentAssistant = null
+    }
+    for (var j = 0; j < state.activity.length; j += 1) renderActivity(state.activity[j])
+    setStatus(state.status, state.busy)
+    setUrl(state.url)
+    host.classList.toggle("hidden", !state.visible)
+    scrollToEnd(els.chat)
+    scrollToEnd(els.activity)
+  }
+
+  function apply(payload) {
+    if (!payload || typeof payload !== "object") return
+    if (payload.kind === "show") {
+      state.visible = true
+      host.classList.remove("hidden")
+      return
+    }
+    if (payload.kind === "hide") {
+      state.visible = false
+      host.classList.add("hidden")
+      return
+    }
+    if (payload.kind === "restore") {
+      restore(payload)
+      return
+    }
+    if (payload.kind === "activity") {
+      addActivity(payload.text, payload.level, payload.at)
+      return
+    }
+    if (payload.kind === "user") {
+      addMessage("user", payload.text, false)
+      return
+    }
+    if (payload.kind === "assistant") {
+      setAssistant(payload.text, !!payload.done)
+      return
+    }
+    if (payload.kind === "system") {
+      addMessage("system", payload.text, false)
+      return
+    }
+    if (payload.kind === "status") {
+      setStatus(payload.text, !!payload.busy)
+      return
+    }
+    if (payload.kind === "url") {
+      setUrl(payload.url)
+      return
+    }
+    if (payload.kind === "clear") {
+      clearAll()
+    }
+  }
+
+  function onSubmit(event) {
+    if (event) event.preventDefault()
+    var text = (els.input.value || "").trim()
+    if (!text || state.busy) return
+    els.input.value = ""
+    var ok = send({ type: "chat", text: text })
+    if (!ok) {
+      addMessage("system", "Нет связи с opencode. Перезапустите opencode и плагин.", false)
+      return
+    }
+    setStatus("модель отвечает…", true)
+  }
+
+  function init() {
+    if (window[GLOBAL] || document.getElementById(HOST_ID)) return
+    host = document.createElement("div")
+    host.id = HOST_ID
+    host.setAttribute("data-opencode-browser-overlay", "1")
+    root = host.attachShadow({ mode: "closed" })
+    var css = [
+      ":host { all: initial; position: fixed; right: 14px; bottom: 14px; width: 370px; max-width: calc(100vw - 28px); display: block; z-index: 2147483647; font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 12px; line-height: 1.45; color: #e8e8ea; contain: layout style; }",
+      ":host(.hidden) { display: none; }",
+      "*, *::before, *::after { box-sizing: border-box; }",
+      ".panel { display: flex; flex-direction: column; width: 100%; max-height: min(540px, 58vh); background: rgba(18, 18, 22, 0.95); border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 12px; box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5); overflow: hidden; backdrop-filter: blur(12px); }",
+      ".head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: rgba(255, 255, 255, 0.05); cursor: pointer; user-select: none; }",
+      ".dot { width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; flex: none; box-shadow: 0 0 8px rgba(245, 158, 11, 0.7); }",
+      ".dot.on { background: #22c55e; box-shadow: 0 0 8px rgba(34, 197, 94, 0.7); }",
+      ".title { font-weight: 600; font-size: 12px; white-space: nowrap; }",
+      ".status { color: #9ca3af; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+      ".spacer { flex: 1; }",
+      ".btn { background: transparent; border: 0; color: #cbd5e1; cursor: pointer; font-family: inherit; font-size: 14px; line-height: 1; padding: 2px 5px; border-radius: 6px; }",
+      ".btn:hover { background: rgba(255, 255, 255, 0.1); }",
+      ".url { padding: 0 10px 7px; color: #93c5fd; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+      ".activity { border-top: 1px solid rgba(255, 255, 255, 0.08); max-height: 104px; overflow: auto; padding: 6px 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; color: #a7b0bd; }",
+      ".activity .line { white-space: pre-wrap; word-break: break-word; padding: 1px 0; }",
+      ".activity .line.error { color: #fca5a5; }",
+      ".activity .line.info { color: #86efac; }",
+      ".activity .line.tool { color: #c4b5fd; }",
+      ".chat { border-top: 1px solid rgba(255, 255, 255, 0.08); max-height: 190px; overflow: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }",
+      ".msg { padding: 6px 8px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; max-width: 100%; }",
+      ".msg.user { align-self: flex-end; background: #2563eb; color: #fff; }",
+      ".msg.assistant { align-self: flex-start; background: rgba(255, 255, 255, 0.08); color: #f1f5f9; }",
+      ".msg.system { align-self: center; color: #9ca3af; font-size: 10px; text-align: center; }",
+      ".msg.pending { color: #9ca3af; font-style: italic; }",
+      ".composer { display: flex; gap: 6px; padding: 8px; border-top: 1px solid rgba(255, 255, 255, 0.08); }",
+      ".input { flex: 1; min-width: 0; background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 255, 255, 0.14); color: #fff; border-radius: 8px; padding: 6px 8px; font: inherit; outline: none; }",
+      ".input:focus { border-color: #3b82f6; }",
+      ".input:disabled { opacity: 0.5; }",
+      ".send { background: #2563eb; color: #fff; border: 0; border-radius: 8px; padding: 0 10px; cursor: pointer; font-size: 14px; }",
+      ".send:disabled { opacity: 0.5; cursor: default; }",
+      ".panel.minimized .url, .panel.minimized .activity, .panel.minimized .chat, .panel.minimized .composer { display: none; }",
+    ].join("\n")
+    try {
+      var sheet = new CSSStyleSheet()
+      sheet.replaceSync(css)
+      root.adoptedStyleSheets = [sheet]
+    } catch (error) {
+      var style = document.createElement("style")
+      style.textContent = css
+      root.appendChild(style)
+    }
+    var panel = document.createElement("div")
+    panel.className = "panel"
+    panel.innerHTML = [
+      '<div class="head">',
+      '<span class="dot"></span>',
+      '<span class="title">opencode browser</span>',
+      '<span class="status">подключение…</span>',
+      '<span class="spacer"></span>',
+      '<button class="btn min" type="button" title="Свернуть">–</button>',
+      '<button class="btn clear" type="button" title="Очистить">×</button>',
+      "</div>",
+      '<div class="url"></div>',
+      '<div class="activity"></div>',
+      '<div class="chat"></div>',
+      '<form class="composer"><input class="input" type="text" placeholder="Написать нейросети…" autocomplete="off" spellcheck="false"><button class="send" type="submit" title="Отправить">→</button></form>',
+    ].join("")
+    root.appendChild(panel)
+    els = {
+      panel: panel,
+      head: panel.querySelector(".head"),
+      dot: panel.querySelector(".dot"),
+      status: panel.querySelector(".status"),
+      url: panel.querySelector(".url"),
+      activity: panel.querySelector(".activity"),
+      chat: panel.querySelector(".chat"),
+      form: panel.querySelector(".composer"),
+      input: panel.querySelector(".input"),
+      send: panel.querySelector(".send"),
+    }
+    els.form.addEventListener("submit", onSubmit)
+    els.head.addEventListener("click", function (event) {
+      if (event.target === els.min || event.target === els.clear) return
+      minimized = !minimized
+      panel.classList.toggle("minimized", minimized)
+    })
+    els.min = panel.querySelector(".min")
+    els.clear = panel.querySelector(".clear")
+    els.min.addEventListener("click", function (event) {
+      event.stopPropagation()
+      minimized = !minimized
+      panel.classList.toggle("minimized", minimized)
+    })
+    els.clear.addEventListener("click", function (event) {
+      event.stopPropagation()
+      clearAll()
+      send({ type: "clear" })
+    })
+    ;["keydown", "keyup", "keypress", "pointerdown", "mousedown", "mouseup", "click", "submit", "input"].forEach(function (type) {
+      host.addEventListener(type, function (event) {
+        event.stopPropagation()
+      })
+    })
+    host.addEventListener("wheel", function (event) {
+      event.stopPropagation()
+    }, { passive: true })
+    function attachHost() {
+      if (document.documentElement && !host.isConnected) document.documentElement.appendChild(host)
+    }
+    attachHost()
+    if (document.documentElement) new MutationObserver(attachHost).observe(document.documentElement, { childList: true })
+    window[GLOBAL] = {
+      apply: apply,
+      show: function () { apply({ kind: "show" }) },
+      hide: function () { apply({ kind: "hide" }) },
+    }
+    setStatus("готово", false)
+    setUrl(location.href)
+    var lastHref = location.href
+    setInterval(function () {
+      if (location.href !== lastHref) {
+        lastHref = location.href
+        setUrl(lastHref)
+      }
+    }, 1000)
+    function announceReady() {
+      if (!send({ type: "ready" })) setTimeout(announceReady, 500)
+    }
+    announceReady()
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init, { once: true })
+  else init()
+}
+
+function overlaySource(token: string): string {
+  return `(${overlayBootstrap.toString()})(${JSON.stringify(token)})`
+}
+
+const OVERLAY_SYSTEM = `You are the assistant inside the opencode browser overlay panel. The user chats with you in a small panel in the corner of the browser while a real Chromium browser is open. The browser is already running: use browser_snapshot before interacting with the page, and never close the browser. Use only browser_* tools; do not call shell, SSH, file, web-fetch, or other tools. You can use the browser_* tools to inspect and control that browser. browser_snapshot returns the page as text because you cannot see images. Keep replies short and practical; the panel is small. Reply in the user's language. Do not describe internal tool plumbing unless asked.`
+
+const BROWSER_TOOL_NAMES = [
+  "browser_open",
+  "browser_goto",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_press",
+  "browser_scroll",
+  "browser_hover",
+  "browser_tabs",
+  "browser_wait",
+  "browser_eval",
+  "browser_screenshot",
+  "browser_history",
+  "browser_overlay",
+]
+
+const OVERLAY_ALLOWED = new Set(BROWSER_TOOL_NAMES.filter((name) => !["browser_open", "browser_close", "browser_overlay"].includes(name)))
 
 const BROWSER_CANDIDATES = [
   process.env.CHROME_PATH,
@@ -286,7 +673,7 @@ class Cdp {
 }
 
 class BrowserSession {
-  options: Required<Pick<BrowserOptions, "headless" | "width" | "height" | "timeoutMs">> & { executablePath?: string }
+  options: Required<Pick<BrowserOptions, "headless" | "width" | "height" | "timeoutMs" | "overlay">> & { executablePath?: string }
   private proc?: ChildProcess
   private port?: number
   private cdp?: Cdp
@@ -296,6 +683,16 @@ class BrowserSession {
   private logs: LogEntry[] = []
   private starting?: Promise<void>
   private exitHandler?: () => void
+  private overlayToken = randomUUID()
+  private overlayInjected = false
+  private overlayReady = false
+  private overlayVisible = true
+  private overlayBusy = false
+  private overlayStatus = "готово"
+  private overlayUrl = "about:blank"
+  private overlayMessages: OverlayMessage[] = []
+  private overlayActivities: OverlayActivity[] = []
+  onChat?: (text: string) => void
 
   constructor(options: BrowserOptions = {}) {
     this.options = {
@@ -303,6 +700,7 @@ class BrowserSession {
       width: options.width ?? 1280,
       height: options.height ?? 900,
       timeoutMs: options.timeoutMs ?? 25000,
+      overlay: options.overlay ?? true,
       executablePath: options.executablePath,
     }
   }
@@ -372,6 +770,7 @@ class BrowserSession {
       const version = await this.waitForDevtools(port, proc)
       this.browserName = cleanText(version?.Browser || path.basename(executable), 80)
       await this.connectPage()
+      this.noteActivity(`browser started: ${this.browserName} (${this.options.headless ? "headless" : "headed"})`, "info")
     } catch (error) {
       this.kill()
       throw error
@@ -425,27 +824,177 @@ class BrowserSession {
     this.cdp = cdp
     this.targetId = target.id
     this.logs = []
+    this.overlayInjected = false
+    this.overlayReady = false
+    if (target.url) this.overlayUrl = target.url
     await cdp.send("Page.enable")
     await cdp.send("Runtime.enable")
     await cdp.send("Log.enable")
     await cdp.send("Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => undefined)
-    cdp.on("Page.javascriptDialogOpening", () => {
+    cdp.on("Runtime.bindingCalled", (params) => {
+      if (params?.name !== OVERLAY_BINDING) return
+      let message: any
+      try {
+        message = JSON.parse(params.payload)
+      } catch {
+        return
+      }
+      if (!message || typeof message !== "object") return
+      if (message.token !== this.overlayToken) return
+      if (message.type === "ready") {
+        this.overlayReady = true
+        this.restoreOverlay()
+      } else if (message.type === "chat" && typeof message.text === "string") {
+        this.onChat?.(message.text)
+      } else if (message.type === "clear") {
+        this.overlayMessages = []
+        this.overlayActivities = []
+      }
+    })
+    cdp.on("Page.javascriptDialogOpening", (params) => {
+      this.noteActivity(`dialog: ${cleanText(params?.message, 160)}`, "info")
       void cdp.send("Page.handleJavaScriptDialog", { accept: true }).catch(() => undefined)
     })
     cdp.on("Page.frameNavigated", (params) => {
-      if (!params?.frame?.parentId) this.logs = []
+      const frame = params?.frame
+      if (frame?.parentId) return
+      this.logs = []
+      this.overlayReady = false
+      if (frame?.url && frame.url !== this.overlayUrl) {
+        this.overlayUrl = frame.url
+        this.noteActivity(`→ ${frame.url}`, "browser")
+      }
+    })
+    cdp.on("Page.loadEventFired", () => {
+      void this.installOverlay()
     })
     cdp.on("Runtime.consoleAPICalled", (params) => {
       const text = (params?.args || [])
         .map((arg: any) => arg?.value ?? arg?.description ?? arg?.type ?? "")
         .join(" ")
-      this.pushLog(String(params?.type || "log"), text)
+      const level = String(params?.type || "log")
+      this.pushLog(level, text)
+      if (/^(error|assert)$/i.test(level)) this.noteActivity(`console: ${text}`, "error")
     })
     cdp.on("Log.entryAdded", (params) => {
       const entry = params?.entry
       if (!entry) return
-      this.pushLog(String(entry.level || "info"), `${entry.text || ""}${entry.url ? ` (${entry.url})` : ""}`)
+      const text = `${entry.text || ""}${entry.url ? ` (${entry.url})` : ""}`
+      this.pushLog(String(entry.level || "info"), text)
+      if (/^(error|assert)$/i.test(String(entry.level || ""))) this.noteActivity(`console: ${text}`, "error")
     })
+    await this.installOverlay()
+  }
+
+  private overlayPayload(payload: OverlayPayload) {
+    if (!this.options.overlay || !this.overlayReady || !this.cdp) return
+    const expression = `(() => { const overlay = window.${OVERLAY_GLOBAL}; if (!overlay || typeof overlay.apply !== "function") return false; overlay.apply(${JSON.stringify(payload)}); return true })()`
+    this.eval<boolean>(expression, false)
+      .then((ok) => {
+        if (!ok) this.overlayReady = false
+      })
+      .catch(() => {
+        this.overlayReady = false
+      })
+  }
+
+  private restoreOverlay() {
+    this.overlayPayload({
+      kind: "restore",
+      messages: this.overlayMessages,
+      activity: this.overlayActivities,
+      busy: this.overlayBusy,
+      status: this.overlayStatus,
+      visible: this.overlayVisible,
+      url: this.overlayUrl,
+    })
+  }
+
+  private async installOverlay() {
+    if (!this.options.overlay || !this.cdp) return
+    try {
+      const source = overlaySource(this.overlayToken)
+      if (!this.overlayInjected) {
+        await this.cdp.send("Runtime.addBinding", { name: OVERLAY_BINDING }).catch(() => undefined)
+        await this.cdp.send("Page.addScriptToEvaluateOnNewDocument", { source }).catch(() => undefined)
+        this.overlayInjected = true
+      }
+      await this.eval(source, false)
+    } catch {
+      return
+    }
+  }
+
+  noteActivity(text: string, level: OverlayActivity["level"] = "browser") {
+    if (!this.options.overlay) return
+    const entry: OverlayActivity = { text: cleanText(text, 400), level, at: Date.now() }
+    if (!entry.text) return
+    this.overlayActivities.push(entry)
+    if (this.overlayActivities.length > 80) this.overlayActivities.shift()
+    this.overlayPayload({ kind: "activity", text: entry.text, level: entry.level, at: entry.at })
+  }
+
+  noteError(text: string) {
+    this.noteActivity(`error: ${text}`, "error")
+  }
+
+  appendUserMessage(text: string) {
+    const last = this.overlayMessages[this.overlayMessages.length - 1]
+    if (last && last.role === "assistant" && last.pending) last.pending = false
+    this.overlayMessages.push({ role: "user", text })
+    if (this.overlayMessages.length > 40) this.overlayMessages.shift()
+    this.overlayPayload({ kind: "user", text })
+  }
+
+  appendSystemMessage(text: string) {
+    this.overlayMessages.push({ role: "system", text })
+    if (this.overlayMessages.length > 40) this.overlayMessages.shift()
+    this.overlayPayload({ kind: "system", text })
+  }
+
+  failAssistant(text: string) {
+    const last = this.overlayMessages[this.overlayMessages.length - 1]
+    if (last && last.role === "assistant" && last.pending) {
+      this.streamAssistant(last.text ? `${last.text}\n\nОшибка: ${text}` : `Ошибка: ${text}`, true)
+      return
+    }
+    this.appendSystemMessage(`Ошибка: ${text}`)
+  }
+
+  streamAssistant(text: string, done: boolean) {
+    let last = this.overlayMessages[this.overlayMessages.length - 1]
+    if (!last || last.role !== "assistant" || last.pending === false) {
+      last = { role: "assistant", text: "", pending: true }
+      this.overlayMessages.push(last)
+      if (this.overlayMessages.length > 40) this.overlayMessages.shift()
+    }
+    last.text = text
+    last.pending = !done
+    this.overlayPayload({ kind: "assistant", text, done })
+  }
+
+  setChatBusy(busy: boolean, status?: string) {
+    this.overlayBusy = busy
+    this.overlayStatus = status || (busy ? "модель отвечает…" : "готово")
+    this.overlayPayload({ kind: "status", text: this.overlayStatus, busy })
+  }
+
+  private setOverlayVisible(visible: boolean) {
+    this.overlayVisible = visible
+    this.overlayPayload({ kind: visible ? "show" : "hide" })
+  }
+
+  async overlay(action: "show" | "hide" | "toggle" | "status" = "status") {
+    if (!this.options.overlay) return "Overlay: disabled"
+    if (action === "status" && (!this.cdp || !this.proc)) {
+      return `Overlay: enabled, browser not running, ${this.overlayVisible ? "visible" : "hidden"}`
+    }
+    await this.ensure()
+    await this.installOverlay()
+    if (action === "show") this.setOverlayVisible(true)
+    else if (action === "hide") this.setOverlayVisible(false)
+    else if (action === "toggle") this.setOverlayVisible(!this.overlayVisible)
+    return `Overlay: ${this.options.overlay ? "enabled" : "disabled"}, ${this.overlayVisible ? "visible" : "hidden"}, ready=${this.overlayReady}\nURL: ${this.overlayUrl}`
   }
 
   private pushLog(level: string, text: string) {
@@ -537,6 +1086,7 @@ class BrowserSession {
     await this.ensure()
     const before = await this.eval<string>("location.href", false).catch(() => "")
     await this.eval(action === "reload" ? "location.reload()" : `history.${action}()`, false)
+    this.noteActivity(`history ${action}`)
     await sleep(300)
     await this.waitForPossibleNavigation(before)
     return this.snapshot({ maxTextChars: 1500, maxElements: 50 })
@@ -628,6 +1178,10 @@ class BrowserSession {
       };
     })()`
     const data = await this.eval<SnapshotData>(script, false)
+    if (data.url && data.url !== this.overlayUrl) {
+      this.overlayUrl = data.url
+      this.overlayPayload({ kind: "url", url: data.url })
+    }
     return this.formatSnapshot(data, maxTextChars, maxElements)
   }
 
@@ -720,6 +1274,7 @@ class BrowserSession {
     await this.cdp!.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y })
     await this.cdp!.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 })
     await this.cdp!.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 })
+    this.noteActivity(`click <${info.tag}> "${cleanText(info.name)}"`)
     await this.waitForPossibleNavigation(before)
     return this.actionSnapshot(`Clicked <${info.tag}> "${cleanText(info.name)}"`, options)
   }
@@ -760,7 +1315,7 @@ class BrowserSession {
         }
         el.dispatchEvent(new Event('input', { bubbles: true }));
       }
-      return { kind: 'text', tag, name };
+      return { kind: 'text', tag, name, password: tag === 'input' && el.type === 'password' };
     })()`, false)
     if (info.kind !== "select") {
       await sleep(50)
@@ -775,9 +1330,11 @@ class BrowserSession {
     } else {
       await sleep(100)
     }
+    const typed = info.password ? "***" : JSON.stringify(options.text)
     const label = info.kind === "select"
       ? `Selected "${cleanText(info.selected)}" in <select> "${cleanText(info.name)}"`
-      : `Typed ${JSON.stringify(options.text)} into <${info.tag}> "${cleanText(info.name)}"`
+      : `Typed ${typed} into <${info.tag}> "${cleanText(info.name)}"`
+    this.noteActivity(info.kind === "select" ? `select "${cleanText(info.selected)}"` : `type ${typed} → <${info.tag}> "${cleanText(info.name)}"`)
     return this.actionSnapshot(label, options)
   }
 
@@ -833,6 +1390,7 @@ class BrowserSession {
     if (!options.key) throw new Error("key is required")
     const before = await this.eval<string>("location.href", false).catch(() => "")
     await this.pressKey(options.key)
+    this.noteActivity(`press ${options.key}`)
     if (/enter|return|space/i.test(options.key)) await this.waitForPossibleNavigation(before)
     else await sleep(150)
     return this.actionSnapshot(`Pressed ${options.key}`, options)
@@ -855,6 +1413,7 @@ class BrowserSession {
       })
     }
     await sleep(250)
+    this.noteActivity(`scroll ${options.to || `${options.dy ?? 600}px`}`)
     return this.actionSnapshot(`Scrolled ${options.to || `${options.dy ?? 600}px`}`, options)
   }
 
@@ -870,12 +1429,14 @@ class BrowserSession {
     await sleep(50)
     await this.cdp!.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: Number(info.x), y: Number(info.y) })
     await sleep(250)
+    this.noteActivity(`hover <${info.tag}> "${cleanText(info.name)}"`)
     return this.actionSnapshot(`Hovered <${info.tag}> "${cleanText(info.name)}"`, options)
   }
 
   async tabs(options: { action?: "list" | "new" | "switch" | "close"; index?: number; id?: string; url?: string } = {}): Promise<string> {
     await this.ensure()
     const action = options.action || "list"
+    this.noteActivity(`tabs ${action}${options.url ? ` ${options.url}` : ""}`)
     if (action === "new") {
       const target = await this.newTarget(normalizeUrl(options.url || "about:blank"))
       await this.attach(target)
@@ -918,19 +1479,24 @@ class BrowserSession {
       const deadline = Date.now() + timeout
       while (Date.now() < deadline) {
         const found = await this.eval<boolean>(`!!document.querySelector(${JSON.stringify(options.selector)})`, false).catch(() => false)
-        if (found) return `Selector appeared after ${timeout - (deadline - Date.now())}ms: ${options.selector}`
+        if (found) {
+          this.noteActivity(`selector appeared: ${options.selector}`)
+          return `Selector appeared after ${timeout - (deadline - Date.now())}ms: ${options.selector}`
+        }
         await sleep(150)
       }
       throw new Error(`Timed out after ${timeout}ms waiting for selector: ${options.selector}`)
     }
     const ms = Math.max(0, Math.min(options.ms ?? 1000, 120000))
     await sleep(ms)
+    this.noteActivity(`wait ${ms}ms`)
     return `Waited ${ms}ms`
   }
 
   async evaluate(expression: string, awaitPromise = true): Promise<string> {
     await this.ensure()
     if (!expression) throw new Error("expression is required")
+    this.noteActivity(`eval (${expression.length} chars)`, "tool")
     if (!this.cdp) throw new Error("Browser tab is not connected")
     const result = await this.cdp.send<any>("Runtime.evaluate", {
       expression,
@@ -971,6 +1537,7 @@ class BrowserSession {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, Buffer.from(data, "base64"))
     const bytes = Math.round((data.length * 3) / 4)
+    this.noteActivity(`screenshot → ${file}`)
     const label = `Screenshot saved: ${file} (${Math.round(bytes / 1024)} KB). The model cannot view images; this file is for the user.`
     if (!options.attach) return label
     return {
@@ -984,6 +1551,8 @@ class BrowserSession {
     if (!this.proc && !this.cdp) return "Browser is not running."
     this.cdp?.close()
     this.cdp = undefined
+    this.overlayReady = false
+    this.overlayInjected = false
     this.kill()
     if (this.profile) {
       const profile = this.profile
@@ -1003,6 +1572,8 @@ class BrowserSession {
     this.proc = undefined
     this.port = undefined
     this.targetId = undefined
+    this.overlayReady = false
+    this.overlayInjected = false
     if (this.exitHandler) {
       process.removeListener("exit", this.exitHandler)
       this.exitHandler = undefined
@@ -1011,26 +1582,166 @@ class BrowserSession {
   }
 }
 
-export const BrowserToolsPlugin: Plugin = async (_input, options) => {
+export const BrowserToolsPlugin: Plugin = async ({ client, directory }, options) => {
   const opts = (options || {}) as Record<string, any>
   const envHeadless = /^(1|true|yes|on)$/i.test(process.env.OPENCODE_BROWSER_HEADLESS || "")
+  const overlayEnv = String(process.env.OPENCODE_BROWSER_OVERLAY || "").toLowerCase()
+  const overlayEnabled = opts.overlay !== false && overlayEnv !== "0" && overlayEnv !== "false" && overlayEnv !== "off"
   const session = new BrowserSession({
     headless: opts.headless === true || envHeadless,
     executablePath: typeof opts.executablePath === "string" ? opts.executablePath : process.env.OPENCODE_BROWSER_PATH || process.env.CHROME_PATH,
     width: typeof opts.width === "number" ? opts.width : Number(opts.width) || undefined,
     height: typeof opts.height === "number" ? opts.height : Number(opts.height) || undefined,
     timeoutMs: typeof opts.timeoutMs === "number" ? opts.timeoutMs : undefined,
+    overlay: overlayEnabled,
   })
+
+  let overlaySessionID: string | undefined
+  let lastModel: { providerID: string; modelID: string } | undefined
+  const overlayAssistantIDs = new Set<string>()
+  const overlayParts = new Map<string, string>()
+  const seenToolStates = new Set<string>()
+
+  const formatError = (error: unknown): string => {
+    if (!error) return "unknown error"
+    if (typeof error === "string") return error
+    if (error instanceof Error) return error.message
+    const value = error as any
+    if (typeof value.message === "string") return value.message
+    if (typeof value.data?.message === "string") return value.data.message
+    try {
+      return JSON.stringify(error)
+    } catch {
+      return String(error)
+    }
+  }
+
+  const buildOverlayTools = async (): Promise<Record<string, boolean>> => {
+    if (!client.tool?.ids) throw new Error("This opencode version does not expose the tool list; cannot restrict the overlay chat to browser tools")
+    const result: any = await client.tool.ids({ query: { directory } })
+    if (result?.error) throw new Error(formatError(result.error))
+    const ids = Array.isArray(result?.data) ? result.data : []
+    if (!ids.length) throw new Error("opencode returned an empty tool list; refusing to start the overlay chat")
+    const tools: Record<string, boolean> = {}
+    for (const id of ids) tools[id] = OVERLAY_ALLOWED.has(id)
+    for (const name of OVERLAY_ALLOWED) tools[name] = true
+    return tools
+  }
+
+  const ensureOverlaySession = async (): Promise<string> => {
+    if (overlaySessionID) return overlaySessionID
+    const result: any = await client.session.create({
+      body: { title: "Чат в браузере" },
+      query: { directory },
+    })
+    if (result?.error) throw new Error(formatError(result.error))
+    const id = result?.data?.id
+    if (!id) throw new Error("opencode did not return a session id")
+    overlaySessionID = id
+    return id
+  }
+
+  const handleOverlayChat = async (text: string) => {
+    const prompt = text.trim()
+    if (!prompt) return
+    session.appendUserMessage(prompt)
+    session.setChatBusy(true)
+    overlayAssistantIDs.clear()
+    overlayParts.clear()
+    seenToolStates.clear()
+    try {
+      const sessionID = await ensureOverlaySession()
+      const result: any = await client.session.prompt({
+        path: { id: sessionID },
+        query: { directory },
+        body: {
+          parts: [{ type: "text", text: prompt }],
+          system: OVERLAY_SYSTEM,
+          tools: await buildOverlayTools(),
+          ...(lastModel ? { model: lastModel } : {}),
+        },
+      })
+      if (result?.error) throw new Error(formatError(result.error))
+      const info = result?.data?.info
+      if (info?.error) throw new Error(formatError(info.error))
+      const parts = Array.isArray(result?.data?.parts) ? result.data.parts : []
+      const final = parts
+        .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+        .map((part: any) => part.text)
+        .join("\n\n")
+        .trim()
+      const streamed = Array.from(overlayParts.values()).join("\n\n").trim()
+      session.streamAssistant(final || streamed || "(нет ответа)", true)
+    } catch (error) {
+      session.failAssistant(formatError(error))
+    } finally {
+      session.setChatBusy(false)
+    }
+  }
+
+  session.onChat = (text) => {
+    void handleOverlayChat(text)
+  }
 
   const run = async (fn: () => Promise<any>): Promise<any> => {
     try {
       return await fn()
     } catch (error) {
-      return `ERROR: ${error instanceof Error ? error.message : String(error)}`
+      const message = error instanceof Error ? error.message : String(error)
+      session.noteError(message)
+      return `ERROR: ${message}`
     }
   }
 
   return {
+    event: async ({ event }) => {
+      try {
+        if (event.type === "message.updated") {
+          const info: any = event.properties.info
+          if (info?.role === "assistant") {
+            if (typeof info.providerID === "string" && typeof info.modelID === "string") {
+              lastModel = { providerID: info.providerID, modelID: info.modelID }
+            }
+            if (overlaySessionID && info.sessionID === overlaySessionID) overlayAssistantIDs.add(info.id)
+          }
+          return
+        }
+        if (event.type === "message.part.updated") {
+          const part: any = event.properties.part
+          if (!overlaySessionID || part?.sessionID !== overlaySessionID) return
+          if (part.type === "text" && overlayAssistantIDs.has(part.messageID)) {
+            overlayParts.set(part.id, typeof part.text === "string" ? part.text : "")
+            const joined = Array.from(overlayParts.values()).join("\n\n").trim()
+            if (joined) session.streamAssistant(joined, false)
+            return
+          }
+          if (part.type === "tool") {
+            const state: any = part.state || {}
+            const key = `${part.id}:${state.status}`
+            if (state.status && !seenToolStates.has(key)) {
+              seenToolStates.add(key)
+              const title = cleanText(state.title || "", 100)
+              const level = state.status === "error" ? "error" : "tool"
+              session.noteActivity(`tool ${part.tool}${title ? `: ${title}` : ` (${state.status})`}`, level)
+            }
+            return
+          }
+          return
+        }
+        if (event.type === "session.error") {
+          if (overlaySessionID && event.properties.sessionID === overlaySessionID) {
+            session.failAssistant(formatError(event.properties.error))
+            session.setChatBusy(false)
+          }
+          return
+        }
+        if (event.type === "session.deleted") {
+          if (overlaySessionID && event.properties.info.id === overlaySessionID) overlaySessionID = undefined
+        }
+      } catch {
+        return
+      }
+    },
     "experimental.chat.system.transform": async (_input, output) => {
       if (opts.prompt === false) return
       output.system.push(SYSTEM_HINT)
@@ -1191,6 +1902,15 @@ export const BrowserToolsPlugin: Plugin = async (_input, options) => {
         },
         async execute(args) {
           return run(() => session.history(args.action))
+        },
+      }),
+      browser_overlay: tool({
+        description: "Show, hide or check the small overlay panel in the bottom-right corner of the browser. The panel shows live browser activity and lets the user chat with the model in real time.",
+        args: {
+          action: tool.schema.enum(["show", "hide", "toggle", "status"]).optional().describe("Action, default status"),
+        },
+        async execute(args) {
+          return run(() => session.overlay(args.action || "status"))
         },
       }),
       browser_close: tool({
